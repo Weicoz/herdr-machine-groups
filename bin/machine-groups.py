@@ -159,46 +159,26 @@ def group_machines(machines, config):
     return groups
 
 def sync_sidebar(config, machines=None):
-    """Synchronize labels and folded states to the native Herdr sidebar."""
+    """Synchronize folded states to the native Herdr sidebar without touching machine labels."""
     if machines is None:
         machines = fetch_machines()
     groups = group_machines(machines, config)
-    sidebar_prefix = config.get("sidebar_prefix", True)
-    sync_sidebar_fold = config.get("sync_sidebar", True)
-
-    renamed_count = 0
     toggled_count = 0
 
     for g in groups:
         g_def = g["def"]
-        g_name = g_def.get("name", "")
         collapsed = g_def.get("collapsed", False)
 
         for m in g["machines"]:
             m_id = m.get("id")
-            cur_label = m.get("label", "")
-            base_label = clean_label(cur_label)
+            cur_enabled = m.get("enabled", True)
+            target_enabled = not collapsed
+            if cur_enabled != target_enabled:
+                action = "enable" if target_enabled else "disable"
+                run_herdr(["machine", action, m_id])
+                toggled_count += 1
 
-            # 1. Label prefix sync
-            if sidebar_prefix:
-                expected_label = f"[{g_name}] {base_label}" if g_def.get("id") != "ungrouped" else base_label
-            else:
-                expected_label = base_label
-
-            if cur_label != expected_label:
-                run_herdr(["machine", "rename", m_id, "--label", expected_label])
-                renamed_count += 1
-
-            # 2. Fold state sync (collapsed = disable from sidebar, expanded = enable)
-            if sync_sidebar_fold:
-                cur_enabled = m.get("enabled", True)
-                target_enabled = not collapsed
-                if cur_enabled != target_enabled:
-                    action = "enable" if target_enabled else "disable"
-                    run_herdr(["machine", action, m_id])
-                    toggled_count += 1
-
-    return renamed_count, toggled_count
+    return toggled_count
 
 def reset_all_labels(machines=None):
     """Remove all [Prefix] labels from machines."""
@@ -408,7 +388,7 @@ class TUI:
             else:
                 self.stdscr.addstr(status_y, 0, "─" * (w - 1), curses.A_DIM)
 
-            footer = " [Space]折叠并同步侧栏  [f]仅看此组  [a]全部展开  [s]同步前缀  [q]退出"
+            footer = " [Space]折叠并同步侧栏  [f]仅看此组  [a]全部展开  [r]刷新  [q]退出"
             self.stdscr.addstr(h - 1, 0, pad_str(footer, w - 1), curses.A_REVERSE)
 
             self.stdscr.refresh()
@@ -440,9 +420,9 @@ class TUI:
             elif key in (ord('a'), ord('A')):
                 self.show_all()
             elif key in (ord('s'), ord('S')):
-                r, t = sync_sidebar(self.config, self.machines)
+                t = sync_sidebar(self.config, self.machines)
                 self.reload()
-                self.status_msg = f"✓ 侧栏前缀与折叠同步完成 (重命名 {r} 台, 状态变更 {t} 台)"
+                self.status_msg = f"✓ 侧栏折叠同步完成 (状态变更 {t} 台)"
             elif key in (ord('r'), ord('R')):
                 self.reload()
                 self.status_msg = "✓ 机器列表已刷新"
@@ -461,8 +441,8 @@ def main():
             print(json.dumps(groups, ensure_ascii=False, indent=2))
             return
         elif cmd in ("sync", "--sync"):
-            r, t = sync_sidebar(cfg, machines)
-            print(f"Sidebar sync complete: {r} machine(s) labeled with group prefix, {t} visibility toggled.")
+            t = sync_sidebar(cfg, machines)
+            print(f"Sidebar sync complete: {t} machine(s) visibility toggled.")
             return
         elif cmd in ("reset-labels", "--reset-labels"):
             count = reset_all_labels(machines)
