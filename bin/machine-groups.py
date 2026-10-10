@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-herdr-machine-groups: Group, tag, and fold Herdr SSH machines with interactive TUI.
+herdr-machine-groups: Group, tag, and fold Herdr SSH machines with interactive TUI and sidebar sync.
 """
 
 import curses
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 import unicodedata
@@ -23,7 +24,6 @@ def get_config_path():
         return GLOBAL_CONFIG
     if os.path.exists(LOCAL_CONFIG):
         return LOCAL_CONFIG
-    # Default to global config path for easy user editing
     return GLOBAL_CONFIG
 
 def str_width(s):
@@ -38,6 +38,10 @@ def pad_str(s, target_width):
     if current < target_width:
         return s + " " * (target_width - current)
     return s
+
+def clean_label(label):
+    """Strip existing [Prefix] from label to get raw name."""
+    return re.sub(r"^\[.*?\]\s*", "", label).strip()
 
 def run_herdr(args):
     cmd = [HERDR_BIN] + args
@@ -61,24 +65,26 @@ def fetch_machines():
 
 def get_default_config():
     return {
+        "sync_sidebar": True,
+        "sidebar_prefix": True,
         "groups": [
             {
                 "id": "cloud",
-                "name": "云端服务器",
+                "name": "云端",
                 "tag": "cloud",
                 "patterns": ["*腾讯云*", "tx-*", "*aliyun*", "*aws*", "*server*"],
                 "collapsed": False
             },
             {
                 "id": "office",
-                "name": "办公与本地",
+                "name": "办公",
                 "tag": "office",
                 "patterns": ["*Mac-Mini*", "*ZERO-X*局域网*", "*local*", "*lan*"],
                 "collapsed": False
             },
             {
                 "id": "mesh",
-                "name": "EasyTier 虚拟网",
+                "name": "EasyTier",
                 "tag": "easytier",
                 "patterns": ["*EasyTier*"],
                 "collapsed": False
@@ -116,18 +122,17 @@ def group_machines(machines, config):
     used_ids = set()
 
     for g_def in config.get("groups", []):
-        g_id = g_def.get("id")
         patterns = g_def.get("patterns", [])
         matched = []
         for m in machines:
             m_id = m.get("id")
-            label = m.get("label", "")
+            raw_label = clean_label(m.get("label", ""))
             target = m.get("target", "")
             if m_id in used_ids:
                 continue
             is_match = False
             for p in patterns:
-                if fnmatch.fnmatch(label, p) or fnmatch.fnmatch(target, p):
+                if fnmatch.fnmatch(raw_label, p) or fnmatch.fnmatch(target, p) or fnmatch.fnmatch(m.get("label", ""), p):
                     is_match = True
                     break
             if is_match:
@@ -144,7 +149,7 @@ def group_machines(machines, config):
         groups.append({
             "def": {
                 "id": "ungrouped",
-                "name": "未分组 (默认)",
+                "name": "未分组",
                 "tag": "other",
                 "collapsed": False
             },
@@ -152,6 +157,61 @@ def group_machines(machines, config):
         })
 
     return groups
+
+def sync_sidebar(config, machines=None):
+    """Synchronize labels and folded states to the native Herdr sidebar."""
+    if machines is None:
+        machines = fetch_machines()
+    groups = group_machines(machines, config)
+    sidebar_prefix = config.get("sidebar_prefix", True)
+    sync_sidebar_fold = config.get("sync_sidebar", True)
+
+    renamed_count = 0
+    toggled_count = 0
+
+    for g in groups:
+        g_def = g["def"]
+        g_name = g_def.get("name", "")
+        collapsed = g_def.get("collapsed", False)
+
+        for m in g["machines"]:
+            m_id = m.get("id")
+            cur_label = m.get("label", "")
+            base_label = clean_label(cur_label)
+
+            # 1. Label prefix sync
+            if sidebar_prefix:
+                expected_label = f"[{g_name}] {base_label}" if g_def.get("id") != "ungrouped" else base_label
+            else:
+                expected_label = base_label
+
+            if cur_label != expected_label:
+                run_herdr(["machine", "rename", m_id, "--label", expected_label])
+                renamed_count += 1
+
+            # 2. Fold state sync (collapsed = disable from sidebar, expanded = enable)
+            if sync_sidebar_fold:
+                cur_enabled = m.get("enabled", True)
+                target_enabled = not collapsed
+                if cur_enabled != target_enabled:
+                    action = "enable" if target_enabled else "disable"
+                    run_herdr(["machine", action, m_id])
+                    toggled_count += 1
+
+    return renamed_count, toggled_count
+
+def reset_all_labels(machines=None):
+    """Remove all [Prefix] labels from machines."""
+    if machines is None:
+        machines = fetch_machines()
+    count = 0
+    for m in machines:
+        cur_label = m.get("label", "")
+        base_label = clean_label(cur_label)
+        if cur_label != base_label:
+            run_herdr(["machine", "rename", m["id"], "--label", base_label])
+            count += 1
+    return count
 
 class TUI:
     def __init__(self, stdscr):
@@ -161,6 +221,10 @@ class TUI:
         self.cursor = 0
         self.status_msg = ""
         self.collapsed_map = {g.get("id"): g.get("collapsed", False) for g in self.config.get("groups", [])}
+        # Initial sync on open if enabled
+        if self.config.get("sync_sidebar", True):
+            sync_sidebar(self.config, self.machines)
+            self.machines = fetch_machines()
 
     def reload(self):
         self.machines = fetch_machines()
@@ -192,8 +256,32 @@ class TUI:
         action = "enable" if enable else "disable"
         run_herdr(["machine", action, profile_id])
 
+    def toggle_group_fold(self, g_id):
+        new_val = not self.collapsed_map.get(g_id, False)
+        self.collapsed_map[g_id] = new_val
+
+        # persist to config
+        for g in self.config.get("groups", []):
+            if g.get("id") == g_id:
+                g["collapsed"] = new_val
+        save_config(self.config, self.config_path)
+
+        # Sync fold to sidebar: if collapsed, disable group machines; if expanded, enable them
+        if self.config.get("sync_sidebar", True):
+            groups = group_machines(self.machines, self.config)
+            for g in groups:
+                if g["def"].get("id") == g_id:
+                    for m in g["machines"]:
+                        self.set_machine_enabled(m["id"], not new_val)
+                    break
+            self.reload()
+            state_str = "折叠 (侧栏隐藏)" if new_val else "展开 (侧栏显示)"
+            self.status_msg = f"✓ 分组已{state_str}"
+        else:
+            state_str = "折叠" if new_val else "展开"
+            self.status_msg = f"✓ 分组已{state_str}"
+
     def focus_group(self, target_group_id):
-        items = self.build_items()
         target_machines = []
         other_machines = []
         target_name = ""
@@ -211,14 +299,29 @@ class TUI:
         for m in other_machines:
             self.set_machine_enabled(m["id"], False)
 
+        # Update collapsed map: target uncollapsed, others collapsed
+        for g in self.config.get("groups", []):
+            g_id = g.get("id")
+            if g_id == target_group_id:
+                g["collapsed"] = False
+                self.collapsed_map[g_id] = False
+            else:
+                g["collapsed"] = True
+                self.collapsed_map[g_id] = True
+        save_config(self.config, self.config_path)
+
         self.reload()
-        self.status_msg = f"✓ 已聚焦分组 [{target_name}]：显示 {len(target_machines)} 台，隐藏 {len(other_machines)} 台"
+        self.status_msg = f"✓ 侧栏已聚焦 [{target_name}]：显示 {len(target_machines)} 台，其余已折叠"
 
     def show_all(self):
         for m in self.machines:
             self.set_machine_enabled(m["id"], True)
+        for g in self.config.get("groups", []):
+            g["collapsed"] = False
+            self.collapsed_map[g.get("id")] = False
+        save_config(self.config, self.config_path)
         self.reload()
-        self.status_msg = f"✓ 已显示全部 {len(self.machines)} 台机器"
+        self.status_msg = f"✓ 侧栏已全部展开并显示 {len(self.machines)} 台机器"
 
     def run(self):
         curses.curs_set(0)
@@ -240,8 +343,8 @@ class TUI:
                 self.cursor = max(0, len(items) - 1)
 
             # Header
-            header = " ◈ Herdr Machine Groups & Clusters ◈"
-            hint_count = f"共 {len(self.machines)} 台机器 "
+            header = " ◈ Herdr Machine Groups & Sidebar Sync ◈"
+            hint_count = f"共 {len(self.machines)} 台 "
             self.stdscr.addstr(0, 0, pad_str(header, w - len(hint_count)), curses.color_pair(1) | curses.A_BOLD)
             self.stdscr.addstr(0, max(0, w - len(hint_count)), hint_count, curses.color_pair(4))
             self.stdscr.addstr(1, 0, "─" * (w - 1), curses.A_DIM)
@@ -268,7 +371,7 @@ class TUI:
                     name_str = f"{arrow} [{g_def.get('name')}]"
                     m_count = len(item["machines"])
                     en_count = sum(1 for m in item["machines"] if m.get("enabled", True))
-                    stats = f"({en_count}/{m_count} 活跃)"
+                    stats = f"({en_count}/{m_count} 侧栏可见)"
                     if collapsed:
                         stats += " [已折叠]"
 
@@ -285,18 +388,17 @@ class TUI:
                     enabled = m.get("enabled", True)
                     dot = "●" if enabled else "○"
                     dot_color = curses.color_pair(2) if enabled else curses.color_pair(3)
-                    state_text = "已启用" if enabled else "已隐藏"
+                    state_text = "侧栏显示" if enabled else "侧栏隐藏"
 
-                    label = m.get("label", "")
+                    label = clean_label(m.get("label", ""))
                     target = m.get("target", "")
-                    line_text = f"    {dot} {label:<24} ({target:<20}) [{state_text}]"
+                    line_text = f"    {dot} {label:<22} ({target:<18}) [{state_text}]"
                     line_disp = pad_str(line_text, w - 2)
 
                     if is_selected:
                         self.stdscr.addstr(y, 0, line_disp[:w-1], curses.color_pair(5))
                     else:
                         self.stdscr.addstr(y, 0, line_disp[:w-1])
-                        # Colorize dot
                         self.stdscr.addstr(y, 4, dot, dot_color)
 
             # Footer / Status
@@ -306,7 +408,7 @@ class TUI:
             else:
                 self.stdscr.addstr(status_y, 0, "─" * (w - 1), curses.A_DIM)
 
-            footer = " [↑/↓]移动  [Space]折叠/展开  [f]仅看此组  [a]显示全部  [t]开关侧栏  [q]退出"
+            footer = " [Space]折叠并同步侧栏  [f]仅看此组  [a]全部展开  [s]同步前缀  [q]退出"
             self.stdscr.addstr(h - 1, 0, pad_str(footer, w - 1), curses.A_REVERSE)
 
             self.stdscr.refresh()
@@ -322,65 +424,56 @@ class TUI:
                 if self.cursor < len(items) - 1:
                     self.cursor += 1
             elif key in (ord(' '), curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT, curses.KEY_LEFT):
-                # Toggle group fold or toggle machine
                 cur_item = items[self.cursor]
                 if cur_item["type"] == "group":
-                    g_id = cur_item["id"]
-                    new_val = not self.collapsed_map.get(g_id, False)
-                    self.collapsed_map[g_id] = new_val
-                    # persist to config
-                    for g in self.config.get("groups", []):
-                        if g.get("id") == g_id:
-                            g["collapsed"] = new_val
-                    save_config(self.config, self.config_path)
+                    self.toggle_group_fold(cur_item["id"])
                 elif cur_item["type"] == "machine":
-                    # Toggle machine enabled
                     m = cur_item["data"]
                     new_state = not m.get("enabled", True)
                     self.set_machine_enabled(m["id"], new_state)
                     self.reload()
+                    self.status_msg = f"✓ 机器 [{clean_label(m.get('label', ''))}] 已{'显示' if new_state else '隐藏'}"
             elif key in (ord('f'), ord('F')):
-                # Focus selected group
                 cur_item = items[self.cursor]
                 target_gid = cur_item["id"] if cur_item["type"] == "group" else cur_item["group_id"]
                 self.focus_group(target_gid)
             elif key in (ord('a'), ord('A')):
                 self.show_all()
-            elif key in (ord('t'), ord('T')):
-                cur_item = items[self.cursor]
-                if cur_item["type"] == "machine":
-                    m = cur_item["data"]
-                    new_state = not m.get("enabled", True)
-                    self.set_machine_enabled(m["id"], new_state)
-                    self.reload()
-                elif cur_item["type"] == "group":
-                    # Toggle all in group
-                    target_machines = cur_item["machines"]
-                    all_enabled = all(m.get("enabled", True) for m in target_machines)
-                    target_state = not all_enabled
-                    for m in target_machines:
-                        self.set_machine_enabled(m["id"], target_state)
-                    self.reload()
-                    self.status_msg = f"✓ 分组机器已全部{'启用' if target_state else '禁用'}"
+            elif key in (ord('s'), ord('S')):
+                r, t = sync_sidebar(self.config, self.machines)
+                self.reload()
+                self.status_msg = f"✓ 侧栏前缀与折叠同步完成 (重命名 {r} 台, 状态变更 {t} 台)"
             elif key in (ord('r'), ord('R')):
                 self.reload()
                 self.status_msg = "✓ 机器列表已刷新"
-            elif key in (ord('q'), ord('Q'), 27): # 27 = ESC
+            elif key in (ord('q'), ord('Q'), 27):
                 break
 
 def main():
+    cfg, _ = load_config()
+    machines = fetch_machines()
+
     if len(sys.argv) > 1:
         cmd = sys.argv[1]
-        cfg, _ = load_config()
-        machines = fetch_machines()
 
         if cmd in ("list", "--list"):
             groups = group_machines(machines, cfg)
             print(json.dumps(groups, ensure_ascii=False, indent=2))
             return
+        elif cmd in ("sync", "--sync"):
+            r, t = sync_sidebar(cfg, machines)
+            print(f"Sidebar sync complete: {r} machine(s) labeled with group prefix, {t} visibility toggled.")
+            return
+        elif cmd in ("reset-labels", "--reset-labels"):
+            count = reset_all_labels(machines)
+            print(f"Reset complete: stripped group prefix from {count} machine(s).")
+            return
         elif cmd in ("all", "show-all"):
             for m in machines:
                 run_herdr(["machine", "enable", m["id"]])
+            for g in cfg.get("groups", []):
+                g["collapsed"] = False
+            save_config(cfg, get_config_path())
             print(f"Show all: enabled {len(machines)} machines in Herdr sidebar.")
             return
         elif cmd in ("focus", "group") and len(sys.argv) > 2:
@@ -398,10 +491,13 @@ def main():
             for m in machines:
                 action = "enable" if m["id"] in target_ids else "disable"
                 run_herdr(["machine", action, m["id"]])
+            for g in cfg.get("groups", []):
+                g["collapsed"] = (g.get("id") != target["def"].get("id"))
+            save_config(cfg, get_config_path())
             print(f"Focused on '{target['def'].get('name')}': {len(target_ids)} machines shown.")
             return
         elif cmd in ("help", "--help", "-h"):
-            print("Usage: machine-groups.py [list | show-all | focus <tag> | help]")
+            print("Usage: machine-groups.py [list | sync | reset-labels | show-all | focus <tag> | help]")
             return
 
     # Run TUI
