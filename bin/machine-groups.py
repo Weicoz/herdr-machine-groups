@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-herdr-machine-groups: Group, tag, fold, and sort Herdr SSH machines with interactive TUI and sidebar sync.
+herdr-machine-groups: Group, tag, fold, and sort Herdr SSH machines with interactive TUI, mouse buttons, and sidebar sync.
 """
 
 import curses
@@ -347,12 +347,13 @@ class TUI:
         self.reload()
         self.status_msg = f"✓ 侧栏已全部展开并显示 {len(self.machines)} 台机器"
 
-    def move_item(self, direction):
+    def move_item(self, direction, target_idx=None):
         """Move selected group or machine up (-1) or down (+1) and sync order to endpoints.json."""
         items = self.build_items()
-        if self.cursor >= len(items):
+        idx_to_use = self.cursor if target_idx is None else target_idx
+        if idx_to_use >= len(items):
             return
-        cur_item = items[self.cursor]
+        cur_item = items[idx_to_use]
 
         if cur_item["type"] == "group":
             g_id = cur_item["id"]
@@ -369,6 +370,11 @@ class TUI:
                 save_config(self.config, self.config_path)
                 sort_and_sync_endpoints(self.config, self.machines, mode="group")
                 self.reload()
+                new_items = self.build_items()
+                for ni, itm in enumerate(new_items):
+                    if itm["type"] == "group" and itm["id"] == g_id:
+                        self.cursor = ni
+                        break
                 self.status_msg = f"✓ 分组 [{cur_item['def'].get('name')}] 已{'上移' if direction < 0 else '下移'}，侧栏已同步"
             else:
                 self.status_msg = "已在边界，无法继续移动"
@@ -384,6 +390,11 @@ class TUI:
                 self.machines[idx], self.machines[new_idx] = self.machines[new_idx], self.machines[idx]
                 apply_endpoints_order([m["id"] for m in self.machines])
                 self.reload()
+                new_items = self.build_items()
+                for ni, itm in enumerate(new_items):
+                    if itm["type"] == "machine" and itm["data"]["id"] == m_id:
+                        self.cursor = ni
+                        break
                 self.status_msg = f"✓ 机器 [{m_label}] 已{'上移' if direction < 0 else '下移'}，侧栏已同步"
             else:
                 self.status_msg = "已在边界，无法继续移动"
@@ -403,133 +414,175 @@ class TUI:
         self.stdscr.keypad(True)
         curses.use_default_colors()
 
+        # Enable mouse events (reporting button clicks & coordinates)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        try:
+            curses.mouseinterval(50)
+        except Exception:
+            pass
+
+        # Send xterm mouse protocol escapes to terminal
+        sys.stdout.write("\033[?1000h\033[?1002h\033[?1006h")
+        sys.stdout.flush()
+
         curses.init_pair(1, curses.COLOR_CYAN, -1)     # Group header
         curses.init_pair(2, curses.COLOR_GREEN, -1)    # Enabled machine
         curses.init_pair(3, curses.COLOR_RED, -1)      # Disabled machine
-        curses.init_pair(4, curses.COLOR_YELLOW, -1)   # Tags / highlights
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)   # Tags / button highlights
         curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN) # Selected cursor
+        curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLUE) # Clickable button style
 
-        while True:
-            self.stdscr.clear()
-            h, w = self.stdscr.getmaxyx()
-            items = self.build_items()
-            if self.cursor >= len(items):
-                self.cursor = max(0, len(items) - 1)
+        try:
+            while True:
+                self.stdscr.clear()
+                h, w = self.stdscr.getmaxyx()
+                items = self.build_items()
+                if self.cursor >= len(items):
+                    self.cursor = max(0, len(items) - 1)
 
-            # Header
-            header = " ◈ Herdr Machine Groups & Clusters ◈"
-            hint_count = f"共 {len(self.machines)} 台机器 "
-            self.stdscr.addstr(0, 0, pad_str(header, w - len(hint_count)), curses.color_pair(1) | curses.A_BOLD)
-            self.stdscr.addstr(0, max(0, w - len(hint_count)), hint_count, curses.color_pair(4))
-            self.stdscr.addstr(1, 0, "─" * (w - 1), curses.A_DIM)
+                btn_up_col = max(10, w - 9)
+                btn_down_col = max(14, w - 5)
+                text_max_w = max(10, btn_up_col - 2)
 
-            # Body
-            visible_rows = h - 5
-            start_row = 0
-            if self.cursor >= visible_rows:
-                start_row = self.cursor - visible_rows + 1
+                # Header
+                header = " ◈ Herdr Machine Groups & Clusters ◈"
+                hint_count = f"共 {len(self.machines)} 台机器 "
+                self.stdscr.addstr(0, 0, pad_str(header, w - len(hint_count)), curses.color_pair(1) | curses.A_BOLD)
+                self.stdscr.addstr(0, max(0, w - len(hint_count)), hint_count, curses.color_pair(4))
+                self.stdscr.addstr(1, 0, "─" * (w - 1), curses.A_DIM)
 
-            for row_idx in range(visible_rows):
-                item_idx = start_row + row_idx
-                if item_idx >= len(items):
-                    break
-                item = items[item_idx]
-                y = 2 + row_idx
-                is_selected = (item_idx == self.cursor)
+                # Body
+                visible_rows = h - 5
+                start_row = 0
+                if self.cursor >= visible_rows:
+                    start_row = self.cursor - visible_rows + 1
 
-                if item["type"] == "group":
-                    g_def = item["def"]
-                    collapsed = item["collapsed"]
-                    arrow = "▶" if collapsed else "▼"
-                    tag_str = f"#{g_def.get('tag', 'grp')}"
-                    name_str = f"{arrow} [{g_def.get('name')}]"
-                    m_count = len(item["machines"])
-                    en_count = sum(1 for m in item["machines"] if m.get("enabled", True))
-                    stats = f"({en_count}/{m_count} 侧栏可见)"
-                    if collapsed:
-                        stats += " [已折叠]"
+                for row_idx in range(visible_rows):
+                    item_idx = start_row + row_idx
+                    if item_idx >= len(items):
+                        break
+                    item = items[item_idx]
+                    y = 2 + row_idx
+                    is_selected = (item_idx == self.cursor)
 
-                    line = f" {name_str} {tag_str} {stats}"
-                    line_disp = pad_str(line, w - 2)
+                    if item["type"] == "group":
+                        g_def = item["def"]
+                        collapsed = item["collapsed"]
+                        arrow = "▶" if collapsed else "▼"
+                        tag_str = f"#{g_def.get('tag', 'grp')}"
+                        name_str = f"{arrow} [{g_def.get('name')}]"
+                        m_count = len(item["machines"])
+                        en_count = sum(1 for m in item["machines"] if m.get("enabled", True))
+                        stats = f"({en_count}/{m_count} 侧栏可见)"
+                        if collapsed:
+                            stats += " [已折叠]"
 
-                    if is_selected:
-                        self.stdscr.addstr(y, 0, line_disp[:w-1], curses.color_pair(5) | curses.A_BOLD)
-                    else:
-                        self.stdscr.addstr(y, 0, line_disp[:w-1], curses.color_pair(1) | curses.A_BOLD)
+                        line = f" {name_str} {tag_str} {stats}"
+                        line_disp = pad_str(line, text_max_w)
 
-                elif item["type"] == "machine":
-                    m = item["data"]
-                    enabled = m.get("enabled", True)
-                    dot = "●" if enabled else "○"
-                    dot_color = curses.color_pair(2) if enabled else curses.color_pair(3)
-                    state_text = "侧栏显示" if enabled else "侧栏隐藏"
+                        if is_selected:
+                            self.stdscr.addstr(y, 0, line_disp[:text_max_w], curses.color_pair(5) | curses.A_BOLD)
+                        else:
+                            self.stdscr.addstr(y, 0, line_disp[:text_max_w], curses.color_pair(1) | curses.A_BOLD)
 
-                    label = clean_label(m.get("label", ""))
-                    target = m.get("target", "")
-                    line_text = f"    {dot} {label:<22} ({target:<18}) [{state_text}]"
-                    line_disp = pad_str(line_text, w - 2)
+                    elif item["type"] == "machine":
+                        m = item["data"]
+                        enabled = m.get("enabled", True)
+                        dot = "●" if enabled else "○"
+                        dot_color = curses.color_pair(2) if enabled else curses.color_pair(3)
+                        state_text = "侧栏显示" if enabled else "侧栏隐藏"
 
-                    if is_selected:
-                        self.stdscr.addstr(y, 0, line_disp[:w-1], curses.color_pair(5))
-                    else:
-                        self.stdscr.addstr(y, 0, line_disp[:w-1])
-                        self.stdscr.addstr(y, 4, dot, dot_color)
+                        label = clean_label(m.get("label", ""))
+                        target = m.get("target", "")
+                        line_text = f"    {dot} {label:<20} ({target:<16}) [{state_text}]"
+                        line_disp = pad_str(line_text, text_max_w)
 
-            # Footer / Status
-            status_y = h - 2
-            if self.status_msg:
-                self.stdscr.addstr(status_y, 0, pad_str(f" {self.status_msg}", w - 1), curses.color_pair(4) | curses.A_BOLD)
-            else:
-                self.stdscr.addstr(status_y, 0, "─" * (w - 1), curses.A_DIM)
+                        if is_selected:
+                            self.stdscr.addstr(y, 0, line_disp[:text_max_w], curses.color_pair(5))
+                        else:
+                            self.stdscr.addstr(y, 0, line_disp[:text_max_w])
+                            self.stdscr.addstr(y, 4, dot, dot_color)
 
-            footer = " [Space]折叠侧栏  [K/J]移动调序  [o]切换排序  [f]仅看此组  [a]展开全部  [q]退出"
-            self.stdscr.addstr(h - 1, 0, pad_str(footer, w - 1), curses.A_REVERSE)
+                    # Draw clickable [▲] [▼] buttons
+                    self.stdscr.addstr(y, btn_up_col, "[▲]", curses.color_pair(4) | curses.A_BOLD)
+                    self.stdscr.addstr(y, btn_down_col, "[▼]", curses.color_pair(4) | curses.A_BOLD)
 
-            self.stdscr.refresh()
+                # Footer / Status
+                status_y = h - 2
+                if self.status_msg:
+                    self.stdscr.addstr(status_y, 0, pad_str(f" {self.status_msg}", w - 1), curses.color_pair(4) | curses.A_BOLD)
+                else:
+                    self.stdscr.addstr(status_y, 0, "─" * (w - 1), curses.A_DIM)
 
-            # Handle Input
-            key = self.stdscr.getch()
-            self.status_msg = ""
+                footer = " [鼠标点击▲/▼]调序  [K/J]键盘调序  [Space]折叠侧栏  [o]切换排序  [f]仅看此组  [q]退出"
+                self.stdscr.addstr(h - 1, 0, pad_str(footer, w - 1), curses.A_REVERSE)
 
-            if key in (curses.KEY_UP, ord('k')):
-                if self.cursor > 0:
-                    self.cursor -= 1
-            elif key in (curses.KEY_DOWN, ord('j')):
-                if self.cursor < len(items) - 1:
-                    self.cursor += 1
-            elif key in (ord('K'), ord('[')):
-                # Move current item up
-                self.move_item(-1)
-                if self.cursor > 0:
-                    self.cursor -= 1
-            elif key in (ord('J'), ord(']')):
-                # Move current item down
-                self.move_item(1)
-                if self.cursor < len(items) - 1:
-                    self.cursor += 1
-            elif key in (ord('o'), ord('O')):
-                self.cycle_sort()
-            elif key in (ord(' '), curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT, curses.KEY_LEFT):
-                cur_item = items[self.cursor]
-                if cur_item["type"] == "group":
-                    self.toggle_group_fold(cur_item["id"])
-                elif cur_item["type"] == "machine":
-                    m = cur_item["data"]
-                    new_state = not m.get("enabled", True)
-                    self.set_machine_enabled(m["id"], new_state)
+                self.stdscr.refresh()
+
+                # Handle Input
+                key = self.stdscr.getch()
+                self.status_msg = ""
+
+                if key == curses.KEY_MOUSE:
+                    try:
+                        _, mx, my, _, bstate = curses.getmouse()
+                        if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED):
+                            row_idx = my - 2
+                            if 0 <= row_idx < visible_rows:
+                                target_item_idx = start_row + row_idx
+                                if target_item_idx < len(items):
+                                    # Clicked [▲]
+                                    if btn_up_col <= mx <= btn_up_col + 2:
+                                        self.cursor = target_item_idx
+                                        self.move_item(-1, target_item_idx)
+                                    # Clicked [▼]
+                                    elif btn_down_col <= mx <= btn_down_col + 2:
+                                        self.cursor = target_item_idx
+                                        self.move_item(1, target_item_idx)
+                                    else:
+                                        self.cursor = target_item_idx
+                                        # If clicked near arrow on group header, toggle fold
+                                        if items[target_item_idx]["type"] == "group" and mx <= 6:
+                                            self.toggle_group_fold(items[target_item_idx]["id"])
+                    except Exception:
+                        pass
+                elif key in (curses.KEY_UP, ord('k')):
+                    if self.cursor > 0:
+                        self.cursor -= 1
+                elif key in (curses.KEY_DOWN, ord('j')):
+                    if self.cursor < len(items) - 1:
+                        self.cursor += 1
+                elif key in (ord('K'), ord('[')):
+                    self.move_item(-1)
+                elif key in (ord('J'), ord(']')):
+                    self.move_item(1)
+                elif key in (ord('o'), ord('O')):
+                    self.cycle_sort()
+                elif key in (ord(' '), curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT, curses.KEY_LEFT):
+                    cur_item = items[self.cursor]
+                    if cur_item["type"] == "group":
+                        self.toggle_group_fold(cur_item["id"])
+                    elif cur_item["type"] == "machine":
+                        m = cur_item["data"]
+                        new_state = not m.get("enabled", True)
+                        self.set_machine_enabled(m["id"], new_state)
+                        self.reload()
+                        self.status_msg = f"✓ 机器 [{clean_label(m.get('label', ''))}] 已{'显示' if new_state else '隐藏'}"
+                elif key in (ord('f'), ord('F')):
+                    cur_item = items[self.cursor]
+                    target_gid = cur_item["id"] if cur_item["type"] == "group" else cur_item["group_id"]
+                    self.focus_group(target_gid)
+                elif key in (ord('a'), ord('A')):
+                    self.show_all()
+                elif key in (ord('r'), ord('R')):
                     self.reload()
-                    self.status_msg = f"✓ 机器 [{clean_label(m.get('label', ''))}] 已{'显示' if new_state else '隐藏'}"
-            elif key in (ord('f'), ord('F')):
-                cur_item = items[self.cursor]
-                target_gid = cur_item["id"] if cur_item["type"] == "group" else cur_item["group_id"]
-                self.focus_group(target_gid)
-            elif key in (ord('a'), ord('A')):
-                self.show_all()
-            elif key in (ord('r'), ord('R')):
-                self.reload()
-                self.status_msg = "✓ 机器列表已刷新"
-            elif key in (ord('q'), ord('Q'), 27):
-                break
+                    self.status_msg = "✓ 机器列表已刷新"
+                elif key in (ord('q'), ord('Q'), 27):
+                    break
+        finally:
+            # Disable mouse tracking on exit
+            sys.stdout.write("\033[?1000l\033[?1002l\033[?1006l")
+            sys.stdout.flush()
 
 def main():
     cfg, _ = load_config()
