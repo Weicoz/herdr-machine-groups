@@ -1,15 +1,15 @@
 id = "herdr-machine-groups"
 name = "Machine Groups"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.0"
-description = "Tag, group, and fold saved SSH machines in an interactive TUI popup. Focus sidebar on specific groups."
+description = "Tag, group, fold, and sort saved SSH machines in an interactive TUI popup. Focus and reorder the sidebar."
 platforms = ["macos", "linux"]
 
 [[panes]]
 id = "manager"
 title = "Machine Groups"
 placement = "popup"
-width = 84
+width = 86
 height = 26
 command = ["python3", "bin/machine-groups.py"]
 
@@ -20,14 +20,24 @@ contexts = ["workspace"]
 command = ["bash", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin herdr-machine-groups --entrypoint manager --placement popup --focus"]
 
 [[actions]]
+id = "sort-groups"
+title = "Machines: sort by groups"
+command = ["python3", "bin/machine-groups.py", "sort", "group"]
+
+[[actions]]
+id = "sort-name"
+title = "Machines: sort by name A-Z"
+command = ["python3", "bin/machine-groups.py", "sort", "name"]
+
+[[actions]]
+id = "sort-status"
+title = "Machines: sort active first"
+command = ["python3", "bin/machine-groups.py", "sort", "status"]
+
+[[actions]]
 id = "show-all"
 title = "Machines: show all in sidebar"
 command = ["python3", "bin/machine-groups.py", "show-all"]
-
-[[actions]]
-id = "focus-cloud"
-title = "Machines: focus cloud group"
-command = ["python3", "bin/machine-groups.py", "focus", "cloud"]
 
 [[actions]]
 id = "focus-office"
@@ -35,6 +45,11 @@ title = "Machines: focus office/local group"
 command = ["python3", "bin/machine-groups.py", "focus", "office"]
 
 [[actions]]
-id = "focus-easytier"
-title = "Machines: focus EasyTier group"
-command = ["python3", "bin/machine-groups.py", "focus", "easytier"]
+id = "focus-test"
+title = "Machines: focus test group"
+command = ["python3", "bin/machine-groups.py", "focus", "test"]
+
+[[actions]]
+id = "focus-cloud"
+title = "Machines: focus cloud group"
+command = ["python3", "bin/machine-groups.py", "focus", "cloud"]

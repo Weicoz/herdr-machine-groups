@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-herdr-machine-groups: Group, tag, and fold Herdr SSH machines with interactive TUI and sidebar sync.
+herdr-machine-groups: Group, tag, fold, and sort Herdr SSH machines with interactive TUI and sidebar sync.
 """
 
 import curses
@@ -18,6 +18,7 @@ PLUGIN_ROOT = os.environ.get("HERDR_PLUGIN_ROOT", os.path.dirname(os.path.dirnam
 CONFIG_DIR = os.environ.get("HERDR_PLUGIN_CONFIG_DIR", os.path.expanduser("~/.config/herdr/plugins/config/herdr-machine-groups"))
 GLOBAL_CONFIG = os.path.expanduser("~/.config/herdr/machine-groups.json")
 LOCAL_CONFIG = os.path.join(CONFIG_DIR, "groups.json")
+ENDPOINTS_JSON = os.path.expanduser("~/.local/state/herdr/client/endpoints.json")
 
 def get_config_path():
     if os.path.exists(GLOBAL_CONFIG):
@@ -40,7 +41,7 @@ def pad_str(s, target_width):
     return s
 
 def clean_label(label):
-    """Strip existing [Prefix] from label to get raw name."""
+    """Strip any [Prefix] from label to get raw clean name."""
     return re.sub(r"^\[.*?\]\s*", "", label).strip()
 
 def run_herdr(args):
@@ -48,7 +49,7 @@ def run_herdr(args):
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         return res.stdout.strip()
-    except Exception as e:
+    except Exception:
         return None
 
 def fetch_machines():
@@ -66,27 +67,26 @@ def fetch_machines():
 def get_default_config():
     return {
         "sync_sidebar": True,
-        "sidebar_prefix": True,
         "groups": [
             {
+                "id": "office",
+                "name": "办公与本地设备",
+                "tag": "office",
+                "patterns": ["*Mac-Mini*", "*ZERO-X*", "*local*", "*lan*"],
+                "collapsed": False
+            },
+            {
+                "id": "test",
+                "name": "测试节点",
+                "tag": "test",
+                "patterns": ["*测试机*", "*test*"],
+                "collapsed": False
+            },
+            {
                 "id": "cloud",
-                "name": "云端",
+                "name": "云端服务器",
                 "tag": "cloud",
                 "patterns": ["*腾讯云*", "tx-*", "*aliyun*", "*aws*", "*server*"],
-                "collapsed": False
-            },
-            {
-                "id": "office",
-                "name": "办公",
-                "tag": "office",
-                "patterns": ["*Mac-Mini*", "*ZERO-X*局域网*", "*local*", "*lan*"],
-                "collapsed": False
-            },
-            {
-                "id": "mesh",
-                "name": "EasyTier",
-                "tag": "easytier",
-                "patterns": ["*EasyTier*"],
                 "collapsed": False
             }
         ]
@@ -114,7 +114,7 @@ def save_config(cfg, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception as e:
+    except Exception:
         pass
 
 def group_machines(machines, config):
@@ -158,6 +158,58 @@ def group_machines(machines, config):
 
     return groups
 
+def apply_endpoints_order(ordered_machine_ids):
+    """Write exact machine order into endpoints.json so Herdr sidebar matches."""
+    if not os.path.exists(ENDPOINTS_JSON):
+        return False
+    try:
+        with open(ENDPOINTS_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ssh_list = data.get("ssh", [])
+        m_map = {m["id"]: m for m in ssh_list}
+
+        new_ssh = [m_map[mid] for mid in ordered_machine_ids if mid in m_map]
+        used = set(ordered_machine_ids)
+        for m in ssh_list:
+            if m["id"] not in used:
+                new_ssh.append(m)
+
+        data["ssh"] = new_ssh
+        with open(ENDPOINTS_JSON, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+def sort_and_sync_endpoints(config, machines=None, mode="group"):
+    """
+    Sort machines according to mode and apply to endpoints.json:
+    - 'group': by group definitions order, preserving existing order in group
+    - 'name': by group definitions order, alphabetically A-Z inside each group
+    - 'status': by group definitions order, active/enabled first inside each group
+    - 'global-name': pure alphabetical A-Z regardless of groups
+    """
+    if machines is None:
+        machines = fetch_machines()
+
+    if mode == "global-name":
+        sorted_m = sorted(machines, key=lambda m: clean_label(m.get("label", "")).lower())
+        ordered_ids = [m["id"] for m in sorted_m]
+    else:
+        groups = group_machines(machines, config)
+        ordered_ids = []
+        for g in groups:
+            m_list = list(g["machines"])
+            if mode == "name":
+                m_list.sort(key=lambda m: clean_label(m.get("label", "")).lower())
+            elif mode == "status":
+                m_list.sort(key=lambda m: (not m.get("enabled", True), clean_label(m.get("label", "")).lower()))
+            for m in m_list:
+                ordered_ids.append(m["id"])
+
+    apply_endpoints_order(ordered_ids)
+    return len(ordered_ids)
+
 def sync_sidebar(config, machines=None):
     """Synchronize folded states to the native Herdr sidebar without touching machine labels."""
     if machines is None:
@@ -180,28 +232,23 @@ def sync_sidebar(config, machines=None):
 
     return toggled_count
 
-def reset_all_labels(machines=None):
-    """Remove all [Prefix] labels from machines."""
-    if machines is None:
-        machines = fetch_machines()
-    count = 0
-    for m in machines:
-        cur_label = m.get("label", "")
-        base_label = clean_label(cur_label)
-        if cur_label != base_label:
-            run_herdr(["machine", "rename", m["id"], "--label", base_label])
-            count += 1
-    return count
-
 class TUI:
+    SORT_MODES = ["group", "name", "status", "global-name"]
+    SORT_LABELS = {
+        "group": "分组默认顺序",
+        "name": "组内名称 A-Z",
+        "status": "组内活跃状态优先",
+        "global-name": "全局名称 A-Z"
+    }
+
     def __init__(self, stdscr):
         self.stdscr = stdscr
         self.config, self.config_path = load_config()
         self.machines = fetch_machines()
         self.cursor = 0
         self.status_msg = ""
+        self.sort_mode_idx = 0
         self.collapsed_map = {g.get("id"): g.get("collapsed", False) for g in self.config.get("groups", [])}
-        # Initial sync on open if enabled
         if self.config.get("sync_sidebar", True):
             sync_sidebar(self.config, self.machines)
             self.machines = fetch_machines()
@@ -240,13 +287,11 @@ class TUI:
         new_val = not self.collapsed_map.get(g_id, False)
         self.collapsed_map[g_id] = new_val
 
-        # persist to config
         for g in self.config.get("groups", []):
             if g.get("id") == g_id:
                 g["collapsed"] = new_val
         save_config(self.config, self.config_path)
 
-        # Sync fold to sidebar: if collapsed, disable group machines; if expanded, enable them
         if self.config.get("sync_sidebar", True):
             groups = group_machines(self.machines, self.config)
             for g in groups:
@@ -279,7 +324,6 @@ class TUI:
         for m in other_machines:
             self.set_machine_enabled(m["id"], False)
 
-        # Update collapsed map: target uncollapsed, others collapsed
         for g in self.config.get("groups", []):
             g_id = g.get("id")
             if g_id == target_group_id:
@@ -303,6 +347,56 @@ class TUI:
         self.reload()
         self.status_msg = f"✓ 侧栏已全部展开并显示 {len(self.machines)} 台机器"
 
+    def move_item(self, direction):
+        """Move selected group or machine up (-1) or down (+1) and sync order to endpoints.json."""
+        items = self.build_items()
+        if self.cursor >= len(items):
+            return
+        cur_item = items[self.cursor]
+
+        if cur_item["type"] == "group":
+            g_id = cur_item["id"]
+            if g_id == "ungrouped":
+                self.status_msg = "未分组不可调序"
+                return
+            groups_list = self.config.get("groups", [])
+            idx = next((i for i, g in enumerate(groups_list) if g.get("id") == g_id), -1)
+            if idx == -1:
+                return
+            new_idx = idx + direction
+            if 0 <= new_idx < len(groups_list):
+                groups_list[idx], groups_list[new_idx] = groups_list[new_idx], groups_list[idx]
+                save_config(self.config, self.config_path)
+                sort_and_sync_endpoints(self.config, self.machines, mode="group")
+                self.reload()
+                self.status_msg = f"✓ 分组 [{cur_item['def'].get('name')}] 已{'上移' if direction < 0 else '下移'}，侧栏已同步"
+            else:
+                self.status_msg = "已在边界，无法继续移动"
+
+        elif cur_item["type"] == "machine":
+            m_id = cur_item["data"]["id"]
+            m_label = clean_label(cur_item["data"].get("label", ""))
+            idx = next((i for i, m in enumerate(self.machines) if m.get("id") == m_id), -1)
+            if idx == -1:
+                return
+            new_idx = idx + direction
+            if 0 <= new_idx < len(self.machines):
+                self.machines[idx], self.machines[new_idx] = self.machines[new_idx], self.machines[idx]
+                apply_endpoints_order([m["id"] for m in self.machines])
+                self.reload()
+                self.status_msg = f"✓ 机器 [{m_label}] 已{'上移' if direction < 0 else '下移'}，侧栏已同步"
+            else:
+                self.status_msg = "已在边界，无法继续移动"
+
+    def cycle_sort(self):
+        """Cycle through sorting modes and immediately sort sidebar."""
+        self.sort_mode_idx = (self.sort_mode_idx + 1) % len(self.SORT_MODES)
+        mode = self.SORT_MODES[self.sort_mode_idx]
+        mode_label = self.SORT_LABELS[mode]
+        sort_and_sync_endpoints(self.config, self.machines, mode=mode)
+        self.reload()
+        self.status_msg = f"✓ 已应用排序：[{mode_label}]，侧栏已同步"
+
     def run(self):
         curses.curs_set(0)
         self.stdscr.nodelay(False)
@@ -323,8 +417,8 @@ class TUI:
                 self.cursor = max(0, len(items) - 1)
 
             # Header
-            header = " ◈ Herdr Machine Groups & Sidebar Sync ◈"
-            hint_count = f"共 {len(self.machines)} 台 "
+            header = " ◈ Herdr Machine Groups & Clusters ◈"
+            hint_count = f"共 {len(self.machines)} 台机器 "
             self.stdscr.addstr(0, 0, pad_str(header, w - len(hint_count)), curses.color_pair(1) | curses.A_BOLD)
             self.stdscr.addstr(0, max(0, w - len(hint_count)), hint_count, curses.color_pair(4))
             self.stdscr.addstr(1, 0, "─" * (w - 1), curses.A_DIM)
@@ -388,7 +482,7 @@ class TUI:
             else:
                 self.stdscr.addstr(status_y, 0, "─" * (w - 1), curses.A_DIM)
 
-            footer = " [Space]折叠并同步侧栏  [f]仅看此组  [a]全部展开  [r]刷新  [q]退出"
+            footer = " [Space]折叠侧栏  [K/J]移动调序  [o]切换排序  [f]仅看此组  [a]展开全部  [q]退出"
             self.stdscr.addstr(h - 1, 0, pad_str(footer, w - 1), curses.A_REVERSE)
 
             self.stdscr.refresh()
@@ -397,12 +491,24 @@ class TUI:
             key = self.stdscr.getch()
             self.status_msg = ""
 
-            if key in (curses.KEY_UP, ord('k'), ord('K')):
+            if key in (curses.KEY_UP, ord('k')):
                 if self.cursor > 0:
                     self.cursor -= 1
-            elif key in (curses.KEY_DOWN, ord('j'), ord('J')):
+            elif key in (curses.KEY_DOWN, ord('j')):
                 if self.cursor < len(items) - 1:
                     self.cursor += 1
+            elif key in (ord('K'), ord('[')):
+                # Move current item up
+                self.move_item(-1)
+                if self.cursor > 0:
+                    self.cursor -= 1
+            elif key in (ord('J'), ord(']')):
+                # Move current item down
+                self.move_item(1)
+                if self.cursor < len(items) - 1:
+                    self.cursor += 1
+            elif key in (ord('o'), ord('O')):
+                self.cycle_sort()
             elif key in (ord(' '), curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT, curses.KEY_LEFT):
                 cur_item = items[self.cursor]
                 if cur_item["type"] == "group":
@@ -419,10 +525,6 @@ class TUI:
                 self.focus_group(target_gid)
             elif key in (ord('a'), ord('A')):
                 self.show_all()
-            elif key in (ord('s'), ord('S')):
-                t = sync_sidebar(self.config, self.machines)
-                self.reload()
-                self.status_msg = f"✓ 侧栏折叠同步完成 (状态变更 {t} 台)"
             elif key in (ord('r'), ord('R')):
                 self.reload()
                 self.status_msg = "✓ 机器列表已刷新"
@@ -440,13 +542,14 @@ def main():
             groups = group_machines(machines, cfg)
             print(json.dumps(groups, ensure_ascii=False, indent=2))
             return
-        elif cmd in ("sync", "--sync"):
-            t = sync_sidebar(cfg, machines)
-            print(f"Sidebar sync complete: {t} machine(s) visibility toggled.")
-            return
-        elif cmd in ("reset-labels", "--reset-labels"):
-            count = reset_all_labels(machines)
-            print(f"Reset complete: stripped group prefix from {count} machine(s).")
+        elif cmd in ("sort", "--sort"):
+            mode = "group"
+            if len(sys.argv) > 2:
+                arg = sys.argv[2].lstrip("-")
+                if arg in ("name", "status", "global-name"):
+                    mode = arg
+            count = sort_and_sync_endpoints(cfg, machines, mode=mode)
+            print(f"Sort complete: reordered {count} machine(s) in Herdr sidebar (mode: {mode}).")
             return
         elif cmd in ("all", "show-all"):
             for m in machines:
@@ -477,7 +580,7 @@ def main():
             print(f"Focused on '{target['def'].get('name')}': {len(target_ids)} machines shown.")
             return
         elif cmd in ("help", "--help", "-h"):
-            print("Usage: machine-groups.py [list | sync | reset-labels | show-all | focus <tag> | help]")
+            print("Usage: machine-groups.py [list | sort [group|name|status|global-name] | show-all | focus <tag> | help]")
             return
 
     # Run TUI
