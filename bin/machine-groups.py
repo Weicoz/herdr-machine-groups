@@ -661,9 +661,46 @@ def main():
             print("Usage: machine-groups.py [list | sort [group|name|status|global-name] | show-all | focus <tag> | help]")
             return
 
-    # Run TUI with safe crash logging
+    # Run TUI with safe crash-proof curses wrapper
+    def safe_curses_run(func):
+        stdscr = curses.initscr()
+        try:
+            try:
+                curses.noecho()
+            except Exception:
+                pass
+            try:
+                curses.cbreak()
+            except Exception:
+                try:
+                    curses.raw()
+                except Exception:
+                    pass
+            try:
+                stdscr.keypad(True)
+            except Exception:
+                pass
+            return func(stdscr)
+        finally:
+            try:
+                stdscr.keypad(False)
+            except Exception:
+                pass
+            try:
+                curses.nocbreak()
+            except Exception:
+                pass
+            try:
+                curses.echo()
+            except Exception:
+                pass
+            try:
+                curses.endwin()
+            except Exception:
+                pass
+
     try:
-        curses.wrapper(lambda stdscr: TUI(stdscr).run())
+        safe_curses_run(lambda stdscr: TUI(stdscr).run())
     except Exception:
         log_file = os.path.expanduser("~/.config/herdr/plugins/logs/herdr-machine-groups-crash.log")
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
