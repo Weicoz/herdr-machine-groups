@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import unicodedata
 
 HERDR_BIN = os.environ.get("HERDR_BIN_PATH", "herdr")
@@ -243,6 +244,7 @@ class TUI:
 
     def __init__(self, stdscr):
         self.stdscr = stdscr
+        self.init_time = time.time()
         self.config, self.config_path = load_config()
         self.machines = fetch_machines()
         self.cursor = 0
@@ -408,6 +410,14 @@ class TUI:
         self.reload()
         self.status_msg = f"✓ 已应用排序：[{mode_label}]，侧栏已同步"
 
+    def color(self, pair_id):
+        if curses.has_colors():
+            try:
+                return curses.color_pair(pair_id)
+            except Exception:
+                return 0
+        return 0
+
     def safe_addstr(self, y, x, text, attr=0):
         h, w = self.stdscr.getmaxyx()
         if 0 <= y < h and 0 <= x < w:
@@ -425,10 +435,15 @@ class TUI:
             pass
         self.stdscr.nodelay(False)
         self.stdscr.keypad(True)
-        try:
-            curses.use_default_colors()
-        except Exception:
-            pass
+        if curses.has_colors():
+            try:
+                curses.start_color()
+            except Exception:
+                pass
+            try:
+                curses.use_default_colors()
+            except Exception:
+                pass
 
         # Enable mouse events (reporting button clicks & coordinates)
         try:
@@ -444,13 +459,20 @@ class TUI:
         except Exception:
             pass
 
+        if curses.has_colors():
+            try:
+                curses.init_pair(1, curses.COLOR_CYAN, -1)     # Group header
+                curses.init_pair(2, curses.COLOR_GREEN, -1)    # Enabled machine
+                curses.init_pair(3, curses.COLOR_RED, -1)      # Disabled machine
+                curses.init_pair(4, curses.COLOR_YELLOW, -1)   # Tags / button highlights
+                curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN) # Selected cursor
+                curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLUE) # Clickable button style
+            except Exception:
+                pass
+
+        # Flush any residual keys or escape characters from shortcut trigger
         try:
-            curses.init_pair(1, curses.COLOR_CYAN, -1)     # Group header
-            curses.init_pair(2, curses.COLOR_GREEN, -1)    # Enabled machine
-            curses.init_pair(3, curses.COLOR_RED, -1)      # Disabled machine
-            curses.init_pair(4, curses.COLOR_YELLOW, -1)   # Tags / button highlights
-            curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN) # Selected cursor
-            curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLUE) # Clickable button style
+            curses.flushinp()
         except Exception:
             pass
 
@@ -469,8 +491,8 @@ class TUI:
                 # Header
                 header = " ◈ Herdr Machine Groups & Clusters ◈"
                 hint_count = f"共 {len(self.machines)} 台机器 "
-                self.safe_addstr(0, 0, pad_str(header, w - len(hint_count)), curses.color_pair(1) | curses.A_BOLD)
-                self.safe_addstr(0, max(0, w - len(hint_count)), hint_count, curses.color_pair(4))
+                self.safe_addstr(0, 0, pad_str(header, w - len(hint_count)), self.color(1) | curses.A_BOLD)
+                self.safe_addstr(0, max(0, w - len(hint_count)), hint_count, self.color(4))
                 self.safe_addstr(1, 0, "─" * (w - 1), curses.A_DIM)
 
                 # Body
@@ -503,15 +525,15 @@ class TUI:
                         line_disp = pad_str(line, text_max_w)
 
                         if is_selected:
-                            self.safe_addstr(y, 0, line_disp[:text_max_w], curses.color_pair(5) | curses.A_BOLD)
+                            self.safe_addstr(y, 0, line_disp[:text_max_w], self.color(5) | curses.A_BOLD)
                         else:
-                            self.safe_addstr(y, 0, line_disp[:text_max_w], curses.color_pair(1) | curses.A_BOLD)
+                            self.safe_addstr(y, 0, line_disp[:text_max_w], self.color(1) | curses.A_BOLD)
 
                     elif item["type"] == "machine":
                         m = item["data"]
                         enabled = m.get("enabled", True)
                         dot = "●" if enabled else "○"
-                        dot_color = curses.color_pair(2) if enabled else curses.color_pair(3)
+                        dot_color = self.color(2) if enabled else self.color(3)
                         state_text = "侧栏显示" if enabled else "侧栏隐藏"
 
                         label = clean_label(m.get("label", ""))
@@ -520,19 +542,19 @@ class TUI:
                         line_disp = pad_str(line_text, text_max_w)
 
                         if is_selected:
-                            self.safe_addstr(y, 0, line_disp[:text_max_w], curses.color_pair(5))
+                            self.safe_addstr(y, 0, line_disp[:text_max_w], self.color(5))
                         else:
                             self.safe_addstr(y, 0, line_disp[:text_max_w])
                             self.safe_addstr(y, 4, dot, dot_color)
 
                     # Draw clickable [▲] [▼] buttons
-                    self.safe_addstr(y, btn_up_col, "[▲]", curses.color_pair(4) | curses.A_BOLD)
-                    self.safe_addstr(y, btn_down_col, "[▼]", curses.color_pair(4) | curses.A_BOLD)
+                    self.safe_addstr(y, btn_up_col, "[▲]", self.color(4) | curses.A_BOLD)
+                    self.safe_addstr(y, btn_down_col, "[▼]", self.color(4) | curses.A_BOLD)
 
                 # Footer / Status
                 status_y = h - 2
                 if self.status_msg:
-                    self.safe_addstr(status_y, 0, pad_str(f" {self.status_msg}", w - 1), curses.color_pair(4) | curses.A_BOLD)
+                    self.safe_addstr(status_y, 0, pad_str(f" {self.status_msg}", w - 1), self.color(4) | curses.A_BOLD)
                 else:
                     self.safe_addstr(status_y, 0, "─" * (w - 1), curses.A_DIM)
 
@@ -542,7 +564,18 @@ class TUI:
                 self.stdscr.refresh()
 
                 # Handle Input
-                key = self.stdscr.getch()
+                try:
+                    key = self.stdscr.getch()
+                except Exception:
+                    continue
+
+                if key == -1:
+                    continue
+
+                # Anti-accidental / focus noise debounce: ignore inputs in first 250ms
+                if time.time() - self.init_time < 0.25:
+                    continue
+
                 self.status_msg = ""
 
                 if key == curses.KEY_MOUSE:
@@ -568,6 +601,52 @@ class TUI:
                                             self.toggle_group_fold(items[target_item_idx]["id"])
                     except Exception:
                         pass
+                elif key == 27:
+                    # Esc key handling: check if it's an escape sequence or bare Esc
+                    self.stdscr.nodelay(True)
+                    ch2 = self.stdscr.getch()
+                    if ch2 == -1:
+                        self.stdscr.nodelay(False)
+                        # Bare Esc pressed by user -> exit
+                        break
+
+                    # Consume remaining escape sequence characters
+                    seq = chr(ch2) if 0 <= ch2 < 256 else ""
+                    while True:
+                        extra = self.stdscr.getch()
+                        if extra == -1:
+                            break
+                        if 0 <= extra < 256:
+                            seq += chr(extra)
+                            if chr(extra).isalpha() or chr(extra) == '~':
+                                break
+                    self.stdscr.nodelay(False)
+
+                    # Check for SGR mouse event: [<0;x;yM
+                    if seq.startswith("[<") and (seq.endswith("M") or seq.endswith("m")):
+                        try:
+                            parts = seq[2:-1].split(";")
+                            b = int(parts[0])
+                            mx = int(parts[1]) - 1
+                            my = int(parts[2]) - 1
+                            is_press = seq.endswith("M")
+                            if is_press and b == 0:  # Left mouse button click
+                                row_idx = my - 2
+                                if 0 <= row_idx < visible_rows:
+                                    target_item_idx = start_row + row_idx
+                                    if target_item_idx < len(items):
+                                        if btn_up_col <= mx <= btn_up_col + 2:
+                                            self.cursor = target_item_idx
+                                            self.move_item(-1, target_item_idx)
+                                        elif btn_down_col <= mx <= btn_down_col + 2:
+                                            self.cursor = target_item_idx
+                                            self.move_item(1, target_item_idx)
+                                        else:
+                                            self.cursor = target_item_idx
+                                            if items[target_item_idx]["type"] == "group" and mx <= 6:
+                                                self.toggle_group_fold(items[target_item_idx]["id"])
+                        except Exception:
+                            pass
                 elif key in (curses.KEY_UP, ord('k')):
                     if self.cursor > 0:
                         self.cursor -= 1
@@ -599,7 +678,7 @@ class TUI:
                 elif key in (ord('r'), ord('R')):
                     self.reload()
                     self.status_msg = "✓ 机器列表已刷新"
-                elif key in (ord('q'), ord('Q'), 27):
+                elif key in (ord('q'), ord('Q')):
                     break
         finally:
             # Disable mouse tracking on exit
@@ -663,8 +742,21 @@ def main():
 
     # Run TUI with safe crash-proof curses wrapper
     def safe_curses_run(func):
-        stdscr = curses.initscr()
         try:
+            stdscr = curses.initscr()
+        except Exception:
+            raise
+
+        try:
+            if curses.has_colors():
+                try:
+                    curses.start_color()
+                except Exception:
+                    pass
+                try:
+                    curses.use_default_colors()
+                except Exception:
+                    pass
             try:
                 curses.noecho()
             except Exception:
@@ -701,7 +793,7 @@ def main():
 
     try:
         safe_curses_run(lambda stdscr: TUI(stdscr).run())
-    except Exception:
+    except Exception as e:
         log_file = os.path.expanduser("~/.config/herdr/plugins/logs/herdr-machine-groups-crash.log")
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         with open(log_file, "a", encoding="utf-8") as f:
